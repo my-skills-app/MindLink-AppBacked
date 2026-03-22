@@ -6,25 +6,32 @@ const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
 const rateLimit = require('express-rate-limit');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Check if running on Vercel
+const isVercel = process.env.VERCEL === '1';
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
-});
-app.use(limiter);
+// Rate limiting (disable for Vercel to avoid issues)
+if (!isVercel) {
+  const rateLimit = require('express-rate-limit');
+  const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 100 // limit each IP to 100 requests per windowMs
+  });
+  app.use(limiter);
+}
 
-// Create uploads directory if it doesn't exist
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) {
+// Create uploads directory if it doesn't exist (only for local development)
+const uploadsDir = isVercel ? '/tmp' : path.join(__dirname, 'uploads');
+if (!isVercel && !fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
 
@@ -33,7 +40,7 @@ let chatMessages = [];
 let users = new Set();
 
 // Initialize Google AI
-const GOOGLE_API_KEY = 'AIzaSyApocfJ8d2kQ042tGgb6gpT0QLZCHZqjOs';
+const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY || 'AIzaSyApocfJ8d2kQ042tGgb6gpT0QLZCHZqjOs';
 const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
 const aiModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
@@ -51,17 +58,17 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
+    fileSize: 10 * 1024 * 1024 // 10MB limit
   },
   fileFilter: function (req, file, cb) {
-    const allowedTypes = /jpeg|jpg|png|gif|webp/;
+    const allowedTypes = /jpeg|jpg|png|gif|webp|pdf/;
     const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
+    const mimetype = allowedTypes.test(file.mimetype) || file.mimetype === 'application/pdf';
     
     if (mimetype && extname) {
       return cb(null, true);
     } else {
-      cb(new Error('Only image files are allowed!'));
+      cb(new Error('Only image files (JPEG, PNG, GIF, WebP) and PDF files are allowed!'));
     }
   }
 });
@@ -76,7 +83,8 @@ app.get('/', (req, res) => {
       upload: '/api/upload',
       users: '/api/users',
       history: '/api/history',
-      ai: '/api/ai'
+      ai: '/api/ai',
+      'ai-upload': '/api/ai-upload'
     }
   });
 });
@@ -206,6 +214,129 @@ app.post('/api/ai', async (req, res) => {
   }
 });
 
+// AI Chat with File Upload Endpoint
+app.post('/api/ai-upload', upload.single('file'), async (req, res) => {
+  try {
+    const { prompt, username, room = 'general' } = req.body;
+    
+    if (!prompt) {
+      return res.status(400).json({
+        success: false,
+        error: 'Prompt is required'
+      });
+    }
+    
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'File is required'
+      });
+    }
+    
+    console.log(`🤖 AI Upload Request from ${username}: ${prompt}`);
+    console.log(`📁 File: ${req.file.filename} (${req.file.mimetype})`);
+    
+    let aiResponse;
+    
+    // Check if it's an image or PDF
+    if (req.file.mimetype.startsWith('image/')) {
+      // For images, use vision model
+      const visionModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      
+      const imageData = {
+        inlineData: {
+          data: fs.readFileSync(req.file.path).toString('base64'),
+          mimeType: req.file.mimetype
+        }
+      };
+      
+      const result = await visionModel.generateContent([prompt, imageData]);
+      const response = await result.response;
+      aiResponse = response.text();
+      
+    } else if (req.file.mimetype === 'application/pdf') {
+      // For PDFs, extract text and process
+      // Note: Gemini can't directly read PDFs, so we'll acknowledge the file
+      const textModel = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+      
+      const enhancedPrompt = `I have uploaded a PDF file named "${req.file.originalname}". ${prompt} Please note that I can see the file name and size (${req.file.size} bytes), but I cannot directly read the PDF content. Please help me based on the file information and my question.`;
+      
+      const result = await textModel.generateContent(enhancedPrompt);
+      const response = await result.response;
+      aiResponse = response.text();
+    }
+    
+    // Add user to online users
+    if (username) {
+      users.add(username);
+    }
+    
+    // Save user message with file info
+    if (username) {
+      const userMessage = {
+        id: uuidv4(),
+        username,
+        message: prompt,
+        room,
+        timestamp: new Date().toISOString(),
+        type: 'text',
+        file: {
+          filename: req.file.filename,
+          originalName: req.file.originalname,
+          size: req.file.size,
+          mimetype: req.file.mimetype,
+          url: `/uploads/${req.file.filename}`
+        }
+      };
+      chatMessages.push(userMessage);
+    }
+    
+    // Save AI response
+    const aiMessage = {
+      id: uuidv4(),
+      username: 'AI Assistant',
+      message: aiResponse,
+      room,
+      timestamp: new Date().toISOString(),
+      type: 'ai',
+      fileAnalyzed: {
+        filename: req.file.filename,
+        originalName: req.file.originalname,
+        size: req.file.size,
+        mimetype: req.file.mimetype
+      }
+    };
+    chatMessages.push(aiMessage);
+    
+    // Keep only last 100 messages per room
+    const roomMessages = chatMessages.filter(msg => msg.room === room);
+    if (roomMessages.length > 100) {
+      chatMessages = chatMessages.filter(msg => msg.room !== room || 
+        roomMessages.indexOf(msg) >= roomMessages.length - 100);
+    }
+    
+    res.json({
+      success: true,
+      aiMessage: aiMessage,
+      fileInfo: {
+        filename: req.file.filename,
+        originalName: req.file.originalname,
+        size: req.file.size,
+        mimetype: req.file.mimetype,
+        url: `/uploads/${req.file.filename}`
+      }
+    });
+    
+  } catch (error) {
+    console.error('🤖 AI Upload Error:', error.message);
+    res.status(500).json({
+      success: false,
+      error: 'AI upload service temporarily unavailable',
+      details: error.message
+    });
+  }
+});
+
 // Get chat history
 app.get('/api/history', (req, res) => {
   try {
@@ -309,13 +440,15 @@ app.use('*', (req, res) => {
   });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🎮 Gaming Chat Proxy API running on port ${PORT}`);
-  console.log(`📁 Uploads directory: ${uploadsDir}`);
-  console.log(`🤖 AI Proxy: Google Gemini 2.5 Flash`);
-  console.log(`🌐 Server: http://localhost:${PORT}`);
-  console.log(`📡 AI Endpoint: http://localhost:${PORT}/api/ai`);
-});
+// Start server (only for local development)
+if (!isVercel) {
+  app.listen(PORT, () => {
+    console.log(`🎮 Gaming Chat Proxy API running on port ${PORT}`);
+    console.log(`📁 Uploads directory: ${uploadsDir}`);
+    console.log(`🤖 AI Proxy: Google Gemini 2.5 Flash`);
+    console.log(`🌐 Server: http://localhost:${PORT}`);
+    console.log(`📡 AI Endpoint: http://localhost:${PORT}/api/ai`);
+  });
+}
 
 module.exports = app;
